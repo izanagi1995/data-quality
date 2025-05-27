@@ -58,7 +58,7 @@ When catching errors, never use generic error types. Use specific errors.
 
 Always write docstrings for public resources.
 
-## 5. Anchor comments
+## 3. Anchor comments
 
 Add specially formatted comments throughout the codebase, where appropriate, for yourself as inline knowledge that can be easily `grep`ped for. 
 
@@ -83,7 +83,7 @@ async def render_feed(...):
     ...
 ```
 
-## 6. Commit discipline
+## 4. Commit discipline
 
 *   **Granular commits**: One logical change per commit.
 *   **Tag AI-generated commits**: e.g., `feat: optimise feed query [AI]`.
@@ -91,3 +91,5 @@ async def render_feed(...):
 *   **Use `git worktree`** for parallel/long-running AI branches (e.g., `git worktree add ../wip-foo -b wip-foo`).
 *   **Review AI-generated code**: Never merge code you don't understand.
 
+## 5. Implementing stories
+When the developer ask you to implement a story, fetch the story content from github using `gh` cli. Create a new branch for this story.
