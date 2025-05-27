@@ -8,10 +8,15 @@ from Databricks Unity Catalog tables using PySpark.
 from typing import Dict, Any, List, Optional
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
-    col, count, sum as spark_sum, isnan, isnull, 
+    col, count, sum as spark_sum, isnan, isnull, when,
     approx_count_distinct, avg, stddev, mean,
     expr, percentile_approx, min as spark_min, max as spark_max
 )
+from pyspark.sql.types import (
+    IntegerType, LongType, FloatType, DoubleType, 
+    DecimalType, NumericType
+)
+from pyspark.sql.utils import AnalysisException
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -105,16 +110,42 @@ class TableMetrics:
                 metrics=additional_metrics
             )
             
+        except AnalysisException as e:
+            # AI-NOTE: Handle table access errors (table not found, permission issues, etc.)
+            raise AnalysisException(f"Failed to access table {table_name}. Verify table exists and you have permissions: {e}")
         except Exception as e:
-            # AI-NOTE: Specific error handling for table access and metrics collection
-            raise Exception(f"Failed to collect metrics for table {table_name}: {e}")
+            # AI-NOTE: Handle other unexpected errors during metrics collection
+            raise RuntimeError(f"Unexpected error during metrics collection for table {table_name}: {e}")
     
     def _calculate_null_counts(self, df: DataFrame) -> Dict[str, int]:
-        """Calculate null counts for each column."""
+        """
+        Calculate null counts for each column using a single aggregation.
+        
+        Handles both numeric and non-numeric columns appropriately.
+        """
+        # AI-NOTE: Build aggregation expressions for all columns in single pass for performance
+        agg_exprs = []
+        for field in df.schema.fields:
+            column_name = field.name
+            # AI-NOTE: For numeric columns, check both isNull and isnan; for others, only isNull
+            if isinstance(field.dataType, (IntegerType, LongType, FloatType, DoubleType, DecimalType)):
+                # Numeric columns can have both null and NaN values
+                null_expr = spark_sum(when(col(column_name).isNull() | isnan(col(column_name)), 1).otherwise(0))
+            else:
+                # Non-numeric columns only check for null values
+                null_expr = spark_sum(when(col(column_name).isNull(), 1).otherwise(0))
+            
+            agg_exprs.append(null_expr.alias(f"null_count_{column_name}"))
+        
+        # Execute single aggregation for all columns
+        result = df.agg(*agg_exprs).collect()[0]
+        
+        # Extract results into dictionary
         null_counts = {}
-        for column in df.columns:
-            null_count = df.filter(col(column).isNull() | isnan(col(column))).count()
-            null_counts[column] = null_count
+        for field in df.schema.fields:
+            column_name = field.name
+            null_counts[column_name] = result[f"null_count_{column_name}"]
+        
         return null_counts
     
     def _calculate_duplicate_count(self, df: DataFrame) -> int:
@@ -139,8 +170,8 @@ class TableMetrics:
             try:
                 unique_count = df.select(approx_count_distinct(col(column))).collect()[0][0]
                 unique_counts[column] = unique_count
-            except Exception as e:
-                # AI-NOTE: Handle cases where approx_count_distinct fails (e.g., complex types)
+            except (AnalysisException, TypeError) as e:
+                # AI-NOTE: Handle cases where approx_count_distinct fails (e.g., complex types, unsupported data types)
                 unique_counts[column] = 0
         return unique_counts
     
@@ -156,11 +187,9 @@ class TableMetrics:
         Returns:
             Dictionary mapping numeric column names to their statistics
         """
-        # AI-NOTE: Filter to only numeric columns to avoid type errors
-        numeric_types = ["int", "bigint", "float", "double", "decimal"]
+        # AI-NOTE: Filter to only numeric columns using proper type checking
         numeric_columns = [field.name for field in df.schema.fields 
-                          if any(numeric_type in str(field.dataType).lower() 
-                                for numeric_type in numeric_types)]
+                          if isinstance(field.dataType, (IntegerType, LongType, FloatType, DoubleType, DecimalType))]
         
         numeric_stats = {}
         
@@ -190,8 +219,8 @@ class TableMetrics:
                     "p95": float(stats_df["p95"]) if stats_df["p95"] is not None else 0.0,
                     "p99": float(stats_df["p99"]) if stats_df["p99"] is not None else 0.0
                 }
-            except Exception as e:
-                # AI-NOTE: Handle edge cases like all-null numeric columns
+            except (AnalysisException, ArithmeticError) as e:
+                # AI-NOTE: Handle edge cases like all-null numeric columns or division by zero in stddev
                 numeric_stats[column] = {
                     "avg": 0.0, "stddev": 0.0, "mean": 0.0, "median": 0.0,
                     "min": 0.0, "max": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0
