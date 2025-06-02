@@ -323,9 +323,9 @@ class TableMetrics:
                     
                 except AnalysisException as e:
                     error_msg = str(e).lower()
-                    version_num = version_info.get('version', 'unknown')
+                    version_num = version_info.get('version', -1)
                     
-                    if any(keyword in error_msg for keyword in ['not available', 'vacuum', 'retention']):
+                    if any(keyword in error_msg for keyword in ['not available', 'vacuum', 'retention', 'cleaned up']):
                         # AI-NOTE: Handle VACUUM-related errors gracefully
                         vacuum_affected.append(version_num)
                         error_summary["vacuum_errors"].append(f"Version {version_num}: {str(e)}")
@@ -338,7 +338,7 @@ class TableMetrics:
                         
                 except Exception as e:
                     # AI-NOTE: Handle unexpected errors
-                    version_num = version_info.get('version', 'unknown')
+                    version_num = version_info.get('version', -1)
                     failed_versions.append(version_num)
                     error_summary["other_errors"].append(f"Version {version_num}: {str(e)}")
                     self.logger.error(f"Unexpected error for {table_name} version {version_num}: {e}")
@@ -376,7 +376,9 @@ class TableMetrics:
         """
         Get available table versions using DESCRIBE HISTORY.
         
-        Returns list of version dictionaries with metadata.
+        Returns list of version dictionaries with metadata, sorted by version number
+        in descending order (newest first). This ordering ensures that when limits
+        are applied, the most recent versions are prioritized for analysis.
         """
         try:
             # AI-NOTE: Use DESCRIBE HISTORY to get table version information

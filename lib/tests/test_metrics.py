@@ -195,6 +195,46 @@ class TestTableMetrics:
         
         assert result.successful_collections == 5
         assert result.total_versions_found == 5  # Should be limited before processing
+    
+    @patch('data_qa_lib.metrics.TableMetrics._get_table_versions')
+    @patch('data_qa_lib.metrics.TableMetrics._collect_version_metrics')
+    def test_collect_historical_metrics_enhanced_vacuum_detection(self, mock_collect_version, mock_get_versions, table_metrics):
+        """Test enhanced VACUUM error detection with 'cleaned up' keyword."""
+        mock_versions = [
+            {'version': 2, 'timestamp': datetime.now(), 'operation': 'WRITE'},
+            {'version': 1, 'timestamp': datetime.now(), 'operation': 'CREATE'}
+        ]
+        mock_get_versions.return_value = mock_versions
+        
+        # AI-NOTE: Simulate different VACUUM error messages to test enhanced detection
+        def side_effect(table_name, version_info, catalog, schema, table):
+            if version_info['version'] == 1:
+                raise AnalysisException("Version 1 has been cleaned up by VACUUM operation")
+            return MetricsResult(
+                table_name="test_table",
+                catalog="test_catalog",
+                schema="test_schema",
+                timestamp=datetime.now(),
+                row_count=100,
+                column_count=5,
+                null_counts={},
+                unique_counts={},
+                numeric_stats={},
+                duplicate_count=0,
+                metrics={}
+            )
+        
+        mock_collect_version.side_effect = side_effect
+        
+        result = table_metrics.collect_historical_metrics("test_catalog.test_schema.test_table")
+        
+        # AI-NOTE: Verify that 'cleaned up' keyword is properly detected as VACUUM error
+        assert result.total_versions_found == 2
+        assert result.successful_collections == 1
+        assert result.failed_collections == 1
+        assert 1 in result.vacuum_affected_versions
+        assert len(result.error_summary["vacuum_errors"]) == 1
+        assert "cleaned up" in result.error_summary["vacuum_errors"][0]
 
 
 class TestVersionMetadata:
