@@ -5,7 +5,7 @@ Provides classes and functions for collecting data quality metrics
 from Databricks Unity Catalog tables using PySpark.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
     col, count, sum as spark_sum, isnan, isnull, when,
@@ -19,6 +19,17 @@ from pyspark.sql.types import (
 from pyspark.sql.utils import AnalysisException
 from pydantic import BaseModel
 from datetime import datetime
+import logging
+
+
+class VersionMetadata(BaseModel):
+    """Metadata for a specific table version."""
+    version: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    operation: Optional[str] = None
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+    commit_info: Optional[Dict[str, Any]] = None
 
 
 class MetricsResult(BaseModel):
@@ -34,6 +45,21 @@ class MetricsResult(BaseModel):
     numeric_stats: Dict[str, Dict[str, float]]
     duplicate_count: int
     metrics: Dict[str, Any]
+    version_metadata: Optional[VersionMetadata] = None
+
+
+class HistoricalMetricsResult(BaseModel):
+    """Pydantic model for historical metrics collection results."""
+    table_name: str
+    catalog: str
+    schema: str
+    collection_timestamp: datetime
+    total_versions_found: int
+    successful_collections: int
+    failed_collections: int
+    vacuum_affected_versions: List[int]
+    metrics_by_version: List[MetricsResult]
+    error_summary: Dict[str, List[str]]
 
 
 class TableMetrics:
@@ -52,6 +78,7 @@ class TableMetrics:
             spark: SparkSession instance. If None, will get or create one.
         """
         self.spark = spark or SparkSession.builder.getOrCreate()
+        self.logger = logging.getLogger(__name__)
     
     def collect_metrics(self, table_name: str) -> MetricsResult:
         """
@@ -227,6 +254,239 @@ class TableMetrics:
                 }
         
         return numeric_stats
+    
+    def collect_historical_metrics(
+        self, 
+        table_name: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        version_start: Optional[int] = None,
+        version_end: Optional[int] = None,
+        max_versions: int = 100,
+        sample_rate: Optional[int] = None
+    ) -> HistoricalMetricsResult:
+        """
+        Collect data quality metrics for all available historical versions of a table.
+        
+        Handles VACUUM-affected versions gracefully by skipping inaccessible versions
+        and continuing with the collection process.
+        
+        Args:
+            table_name: Full table name in format 'catalog.schema.table'
+            start_date: Start date for filtering versions (ISO format: 'YYYY-MM-DD')
+            end_date: End date for filtering versions (ISO format: 'YYYY-MM-DD')
+            version_start: Start version number for filtering
+            version_end: End version number for filtering
+            max_versions: Maximum number of versions to process (default: 100)
+            sample_rate: If specified, process every Nth version (e.g., 5 = every 5th version)
+            
+        Returns:
+            HistoricalMetricsResult containing metrics for all accessible versions
+            
+        Raises:
+            ValueError: If table name format is invalid or invalid date ranges
+            Exception: If table cannot be accessed or no versions are found
+        """
+        # AI-NOTE: Validate table name format for Unity Catalog
+        if table_name.count('.') != 2:
+            raise ValueError("Table name must be in format 'catalog.schema.table'")
+        
+        catalog, schema, table = table_name.split('.')
+        
+        try:
+            # AI-NOTE: Get table history to find available versions
+            versions_info = self._get_table_versions(table_name, start_date, end_date, version_start, version_end)
+            
+            if not versions_info:
+                raise Exception(f"No table versions found for {table_name} with specified criteria")
+            
+            # AI-NOTE: Apply sampling and limit constraints
+            if sample_rate and sample_rate > 1:
+                versions_info = versions_info[::sample_rate]
+            
+            if len(versions_info) > max_versions:
+                self.logger.warning(f"Found {len(versions_info)} versions, limiting to {max_versions}")
+                versions_info = versions_info[:max_versions]
+            
+            # AI-NOTE: Collect metrics for each version with VACUUM error handling
+            successful_metrics = []
+            failed_versions = []
+            vacuum_affected = []
+            error_summary = {"vacuum_errors": [], "analysis_errors": [], "other_errors": []}
+            
+            for version_info in versions_info:
+                try:
+                    version_metrics = self._collect_version_metrics(
+                        table_name, version_info, catalog, schema, table
+                    )
+                    successful_metrics.append(version_metrics)
+                    
+                except AnalysisException as e:
+                    error_msg = str(e).lower()
+                    version_num = version_info.get('version', 'unknown')
+                    
+                    if any(keyword in error_msg for keyword in ['not available', 'vacuum', 'retention']):
+                        # AI-NOTE: Handle VACUUM-related errors gracefully
+                        vacuum_affected.append(version_num)
+                        error_summary["vacuum_errors"].append(f"Version {version_num}: {str(e)}")
+                        self._log_vacuum_warning(table_name, version_num, e)
+                    else:
+                        # AI-NOTE: Handle other analysis errors
+                        failed_versions.append(version_num)
+                        error_summary["analysis_errors"].append(f"Version {version_num}: {str(e)}")
+                        self.logger.error(f"Analysis error for {table_name} version {version_num}: {e}")
+                        
+                except Exception as e:
+                    # AI-NOTE: Handle unexpected errors
+                    version_num = version_info.get('version', 'unknown')
+                    failed_versions.append(version_num)
+                    error_summary["other_errors"].append(f"Version {version_num}: {str(e)}")
+                    self.logger.error(f"Unexpected error for {table_name} version {version_num}: {e}")
+            
+            # AI-NOTE: Log summary of collection results
+            total_versions = len(versions_info)
+            successful_count = len(successful_metrics)
+            failed_count = len(failed_versions) + len(vacuum_affected)
+            
+            self.logger.info(
+                f"Historical metrics collection for {table_name}: "
+                f"{successful_count}/{total_versions} successful, "
+                f"{len(vacuum_affected)} VACUUM-affected, "
+                f"{len(failed_versions)} other failures"
+            )
+            
+            return HistoricalMetricsResult(
+                table_name=table,
+                catalog=catalog,
+                schema=schema,
+                collection_timestamp=datetime.now(),
+                total_versions_found=total_versions,
+                successful_collections=successful_count,
+                failed_collections=failed_count,
+                vacuum_affected_versions=vacuum_affected,
+                metrics_by_version=successful_metrics,
+                error_summary=error_summary
+            )
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to collect historical metrics for table {table_name}: {e}")
+    
+    def _get_table_versions(self, table_name: str, start_date: Optional[str], end_date: Optional[str], 
+                           version_start: Optional[int], version_end: Optional[int]) -> List[Dict[str, Any]]:
+        """
+        Get available table versions using DESCRIBE HISTORY.
+        
+        Returns list of version dictionaries with metadata.
+        """
+        try:
+            # AI-NOTE: Use DESCRIBE HISTORY to get table version information
+            history_df = self.spark.sql(f"DESCRIBE HISTORY {table_name}")
+            versions = history_df.collect()
+            
+            # AI-NOTE: Convert to list of dictionaries and sort by version descending
+            versions_info = []
+            for row in versions:
+                version_dict = row.asDict()
+                
+                # AI-NOTE: Apply filtering based on provided criteria
+                version_num = version_dict.get('version')
+                timestamp = version_dict.get('timestamp')
+                
+                # Filter by version range
+                if version_start is not None and version_num < version_start:
+                    continue
+                if version_end is not None and version_num > version_end:
+                    continue
+                
+                # Filter by date range
+                if start_date and timestamp:
+                    if timestamp.date() < datetime.fromisoformat(start_date).date():
+                        continue
+                if end_date and timestamp:
+                    if timestamp.date() > datetime.fromisoformat(end_date).date():
+                        continue
+                
+                versions_info.append(version_dict)
+            
+            # AI-NOTE: Sort by version number (newest first)
+            return sorted(versions_info, key=lambda x: x.get('version', 0), reverse=True)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get table versions for {table_name}: {e}")
+            raise
+    
+    def _collect_version_metrics(self, table_name: str, version_info: Dict[str, Any], 
+                                catalog: str, schema: str, table: str) -> MetricsResult:
+        """
+        Collect metrics for a specific table version.
+        
+        Args:
+            table_name: Full table name
+            version_info: Dictionary containing version metadata
+            catalog, schema, table: Table name components
+            
+        Returns:
+            MetricsResult with version-specific metrics
+        """
+        version_num = version_info.get('version')
+        
+        # AI-NOTE: Use Delta Lake time travel syntax to access specific version
+        if version_num is not None:
+            versioned_table = f"{table_name}@v{version_num}"
+        else:
+            versioned_table = table_name
+        
+        # AI-NOTE: Load the specific version of the table
+        df = self.spark.table(versioned_table)
+        
+        # AI-NOTE: Collect standard metrics for this version
+        row_count = df.count()
+        column_count = len(df.columns)
+        null_counts = self._calculate_null_counts(df)
+        unique_counts = self._calculate_unique_counts(df)
+        numeric_stats = self._calculate_numeric_stats(df)
+        duplicate_count = self._calculate_duplicate_count(df)
+        additional_metrics = self._calculate_additional_metrics(df)
+        
+        # AI-NOTE: Create version metadata object
+        version_metadata = VersionMetadata(
+            version=version_info.get('version'),
+            timestamp=version_info.get('timestamp'),
+            operation=version_info.get('operation'),
+            user_id=version_info.get('userId'),
+            user_name=version_info.get('userName'),
+            commit_info={
+                k: v for k, v in version_info.items() 
+                if k not in ['version', 'timestamp', 'operation', 'userId', 'userName']
+            }
+        )
+        
+        return MetricsResult(
+            table_name=table,
+            catalog=catalog,
+            schema=schema,
+            timestamp=version_info.get('timestamp', datetime.now()),
+            row_count=row_count,
+            column_count=column_count,
+            null_counts=null_counts,
+            unique_counts=unique_counts,
+            numeric_stats=numeric_stats,
+            duplicate_count=duplicate_count,
+            metrics=additional_metrics,
+            version_metadata=version_metadata
+        )
+    
+    def _log_vacuum_warning(self, table_name: str, version: Union[int, str], error: Exception) -> None:
+        """
+        Log a warning message for VACUUM-affected versions.
+        
+        Provides clear guidance about why versions might be unavailable.
+        """
+        self.logger.warning(
+            f"Version {version} of table {table_name} is not available, "
+            f"likely due to VACUUM operation. This is expected behavior when "
+            f"Databricks has cleaned up old table versions. Error: {error}"
+        )
     
     def _calculate_additional_metrics(self, df: DataFrame) -> Dict[str, Any]:
         """Calculate additional data quality metrics."""
